@@ -6,12 +6,16 @@ const reloadcounter = Number(url.searchParams.get("reloadcounter")) || 0;
 let counter = 60 * 3;
 let paused = false;
 const show = () => display.textContent = `${counter} / ${reloadcounter}`;
+const pause = (state) => {
+	paused = state;
+	display.style.background = paused ? "green" : "red";
+};
 const display = createElement("count-down", {
-	style: "position:fixed;top:0;left:0;z-index:99999;padding:4px 8px;font:bold 16px monospace;background:red;color:#fff;cursor:pointer;user-select:none",
-	onclick: () => {
-		paused = !paused;
-		display.style.background = paused ? "green" : "red";
-	}
+	style: "position:fixed;top:0;left:0;z-index:99999;"
+				+"padding:4px 8px;font:bold 21px monospace;"
+				+"background:red;color:#fff;cursor:pointer;user-select:none",
+	onmouseenter: () => pause(true),
+	onmouseleave: () => pause(false)
 });
 show();
 document.body.append(display);
