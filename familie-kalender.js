@@ -1,5 +1,3 @@
-import DATA from './familie-data.js';
-
 const createElement = (tag, props = {}) => Object.assign(document.createElement(tag), props);
 // createElement + children
 const h = (tag, props = {}, ...children) => {
@@ -21,6 +19,81 @@ const ICONS = {
   d: '<path d="M10 10h4v11h-4z"/><path d="M12 7.5c1.2-1 1.2-2.4 0-4-1.2 1.6-1.2 3 0 4z"/><path d="M7 21h10"/>',
 };
 const icon = (t, size = 18) => createElement('span', { className: 'icon', innerHTML: SVG(ICONS[t], size) });
+
+// ---- family tree: <branch name> <partners date end> <person date death relation ex icon branchonly>
+const parseDate = (s) => {
+  const [y, m, d] = (s || '').split('-').map(Number);
+  return y && m && d ? { y, m, d } : null;
+};
+const fullYears = (from, to) => to.y - from.y - (to.m < from.m || (to.m === from.m && to.d < from.d) ? 1 : 0);
+
+// fetch a tree file and inline every <branch file="..."> it links to (relative to that file)
+const loadTree = async (url) => {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${url}: ${res.status}`);
+  const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+  await Promise.all([...doc.querySelectorAll('branch[file]')].map(async (b) => {
+    try {
+      const sub = await loadTree(new URL(b.getAttribute('file'), url));
+      b.replaceWith(doc.importNode(sub, true));
+    } catch (err) {
+      console.warn('familie-kalender: branch not loaded', err);
+    }
+  }));
+  return doc.querySelector('branch');
+};
+
+// flatten the tree into calendar entries: b = verjaardag, d = in memoriam, w = trouwdag
+const treeToEntries = (root) => {
+  const out = [];
+  const nameOf = (p) => p.textContent.trim();
+  const addPerson = (p, sub) => {
+    const born = parseDate(p.getAttribute('date'));
+    if (!born || p.hasAttribute('branchonly')) return;
+    const ex = p.getAttribute('ex');
+    if (ex) sub = 'ex van ' + ex;
+    if (p.hasAttribute('relation')) sub = p.getAttribute('relation');
+    const death = parseDate(p.getAttribute('death'));
+    out.push({
+      t: death ? 'd' : 'b', ...born, n: nameOf(p), icon: p.getAttribute('icon') || '', sub,
+      died: death?.y, age: death && fullYears(born, death),
+    });
+  };
+  const walk = (branch, parentName) => {
+    const name = branch.getAttribute('name');
+    // a branch's own head belongs to the parent branch, everyone else to this branch
+    const family = (p) => (nameOf(p) === name ? parentName : name);
+    const familyOf = (p) => (family(p) ? 'familie van ' + family(p) : '');
+    for (const el of branch.children) {
+      if (el.localName === 'branch') walk(el, name);
+      else if (el.localName === 'person') addPerson(el, familyOf(el));
+      else if (el.localName === 'partners') {
+        const ps = [...el.querySelectorAll(':scope > person')];
+        for (const p of ps) {
+          const other = ps.find((o) => o !== p);
+          const sub = !other ? familyOf(p)
+            : p.hasAttribute('ex') ? 'ex van ' + nameOf(other)
+            : other.hasAttribute('ex') ? familyOf(p)
+            : 'partner van ' + nameOf(other);
+          addPerson(p, sub);
+        }
+        // trouwdag; skipped for marriages that ended in divorce (end="year")
+        const wed = parseDate(el.getAttribute('date'));
+        if (wed && !el.hasAttribute('end') && ps.length) {
+          const deaths = ps.map((p) => parseDate(p.getAttribute('death'))).filter(Boolean)
+            .sort((a, b) => a.y - b.y || a.m - b.m || a.d - b.d);
+          const end = deaths[0]; // a marriage ends with the first death
+          out.push({
+            t: 'w', ...wed, n: ps.map(nameOf).join(' & '), icon: '',
+            fx: end ? fullYears(wed, end) : undefined, end: end?.y,
+          });
+        }
+      }
+    }
+  };
+  walk(root);
+  return out.sort((a, b) => a.m - b.m || a.d - b.d);
+};
 
 const STYLE = /*css*/ `
 :host{
@@ -112,12 +185,27 @@ customElements.define(
     constructor() {
       super();
       this.state = { filter: 'all', showMem: true };
+      this.data = [];
+      this.familyName = '';
+      this.status = 'Kalender laden…';
       this.attachShadow({ mode: 'open' });
     }
 
-    connectedCallback() {
+    async connectedCallback() {
       this.render();
       this.scheduleMidnight();
+      const src = new URL(this.getAttribute('src') || 'engelman.html', document.baseURI);
+      try {
+        const root = await loadTree(src);
+        if (!root) throw new Error(`${src}: geen <branch> gevonden`);
+        this.familyName = root.getAttribute('name') || '';
+        this.data = treeToEntries(root);
+        this.status = '';
+      } catch (err) {
+        console.error('familie-kalender', err);
+        this.status = 'De familiegegevens konden niet worden geladen.';
+      }
+      this.render();
     }
 
     disconnectedCallback() {
@@ -147,7 +235,6 @@ customElements.define(
       const Y = now.getFullYear(), TM = now.getMonth() + 1, TD = now.getDate();
       const today0 = new Date(Y, TM - 1, TD);
 
-      const rel = (e) => (e.r ? (e.rk === 'p' ? 'partner van ' : 'familie van ') + e.r : '');
       const visible = (e) => {
         if (e.t === 'd' && !showMem) return false;
         if (filter === 'b') return e.t === 'b' || e.t === 'd';
@@ -161,7 +248,7 @@ customElements.define(
       // ---- header
       const header = h('header', {},
         h('div', { className: 'titles' },
-          h('h1', { textContent: 'Engelman Familie Kalender' }),
+          h('h1', { textContent: `${this.familyName} Familie Kalender`.trim() }),
           h('p', { textContent: `Verjaardagen, trouwdagen en herdenkingen · vandaag is het ${DAYSL[now.getDay()]} ${TD} ${MONTHS[TM - 1]} ${Y}` })),
         h('div', { className: 'controls' },
           h('div', { className: 'filters', role: 'group', ariaLabel: 'Filter' },
@@ -172,7 +259,7 @@ customElements.define(
             'In memoriam tonen')));
 
       // ---- binnenkort: komende 30 dagen, max 8
-      const upcoming = DATA.filter((e) => e.t !== 'd' || showMem)
+      const upcoming = this.data.filter((e) => e.t !== 'd' || showMem)
         .map((e) => {
           let yr = Y, dt = new Date(yr, e.m - 1, e.d);
           if (dt < today0) dt = new Date(++yr, e.m - 1, e.d);
@@ -191,7 +278,7 @@ customElements.define(
             h('div', { className: 'top' },
               h('span', { className: 'pill when', textContent: away === 0 ? 'Vandaag' : `${DAYS[dt.getDay()]} ${e.d} ${MSHORT[e.m - 1]}` }),
               h('span', { className: 'away', textContent: away === 0 ? '' : away === 1 ? 'morgen' : `over ${away} dagen` })),
-            h('div', { className: 'who' }, icon(e.t), h('strong', { textContent: e.n })),
+            h('div', { className: 'who' }, icon(e.t), h('strong', { textContent: e.icon ? `${e.n} ${e.icon}` : e.n })),
             h('span', { className: 'line', textContent: line }));
         });
 
@@ -199,7 +286,7 @@ customElements.define(
         h('div', { className: 'head' }, h('h2', { textContent: 'Binnenkort' }), h('span', { textContent: 'de komende 30 dagen' })),
         upcoming.length
           ? h('div', { className: 'upcoming' }, upcoming)
-          : h('p', { className: 'none', textContent: 'Niets in de komende 30 dagen.' }));
+          : h('p', { className: 'none', role: 'status', textContent: this.status || 'Niets in de komende 30 dagen.' }));
 
       // ---- legenda
       const legendItem = (t, text) => h('span', { className: `t-${t}` }, icon(t, 16), text);
@@ -214,13 +301,13 @@ customElements.define(
       const months = MONTHS.map((name, i) => {
         const m = i + 1;
         const isCurrent = m === TM;
-        const rows = DATA.filter((e) => e.m === m && visible(e)).map((e) => {
+        const rows = this.data.filter((e) => e.m === m && visible(e)).map((e) => {
           const isToday = isCurrent && e.d === TD;
           const past = m < TM || (isCurrent && e.d < TD);
           let num, sub, tip;
           if (e.t === 'b') {
             num = Y - e.y;
-            sub = rel(e);
+            sub = e.sub;
             tip = `${e.n} ${past ? 'werd ' : isToday ? 'wordt vandaag ' : 'wordt '}${num} (geboren ${e.y})`;
           } else if (e.t === 'w') {
             num = e.fx != null ? e.fx : Y - e.y;
@@ -228,7 +315,7 @@ customElements.define(
             tip = `${e.n}: ${e.fx != null ? num + ' jaar getrouwd geweest' : num + ' jaar getrouwd in ' + Y}`;
           } else {
             num = e.age;
-            sub = rel(e);
+            sub = e.sub;
             tip = `${e.n}, geboren ${e.y}, overleden in ${e.died} op ${e.age}-jarige leeftijd`;
           }
           return h('div', { className: `row t-${e.t}${isToday ? ' today' : ''}${past ? ' past' : ''}`, title: tip },
@@ -236,7 +323,7 @@ customElements.define(
             icon(e.t),
             h('span', { className: 'txt' },
               h('span', { className: 'name' },
-                e.n,
+                e.icon ? `${e.n} ${e.icon}` : e.n,
                 e.t === 'd' && h('span', { className: 'died', textContent: ` · † ${e.died}` }),
                 isToday && h('span', { className: 'pill now', textContent: 'vandaag' })),
               sub && h('span', { className: 'sub', textContent: sub })),
